@@ -1,229 +1,240 @@
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import morgan from 'morgan';
-import rateLimit from 'express-rate-limit';
-import dotenv from 'dotenv';
-import axios from 'axios';
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import morgan from "morgan";
+import rateLimit from "express-rate-limit";
+import dotenv from "dotenv";
+import axios from "axios";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+/* =======================
+   MIDDLEWARE
+======================= */
 app.use(helmet());
-app.use(morgan('combined'));
+app.use(morgan("combined"));
 app.use(express.json());
 
-// CORS configuration
-const corsOptions = {
-  origin: process.env.FRONTEND_URL || '*', // Update with your frontend URL in production
-  credentials: true,
-  optionsSuccessStatus: 200
-};
-app.use(cors(corsOptions));
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "*",
+    credentials: true,
+  })
+);
 
-// Rate limiting
+/* =======================
+   RATE LIMITING
+======================= */
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
+  windowMs: 15 * 60 * 1000,
+  max: 100,
 });
-app.use('/api/', limiter);
+app.use("/api/", limiter);
 
-// Stricter rate limit for chat endpoint
 const chatLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 10, // 10 requests per minute
-  message: 'Too many chat requests, please slow down.'
+  windowMs: 60 * 1000,
+  max: 10,
 });
 
-// Model server configuration
-const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL || 'https://nonreversed-soulfully-olga.ngrok-free.dev';
-const MODEL_API_KEY = process.env.MODEL_API_KEY || 'secret-api-key';
+/* =======================
+   ENV VARIABLES
+======================= */
+const MODEL_SERVER_URL = process.env.MODEL_SERVER_URL;
+const MODEL_API_KEY = process.env.MODEL_API_KEY || "secret-api-key";
+const RAG_SERVICE_URL = process.env.RAG_SERVICE_URL;
 
-// Store conversation history in memory (use Redis/DB for production)
+/* =======================
+   IN-MEMORY CHAT STORE
+======================= */
 const conversationStore = new Map();
 
-// Helper function to call model server
+/* =======================
+   MODEL SERVER CALL
+======================= */
 async function callModelServer(endpoint, data) {
-  try {
-    const response = await axios.post(
-      `${MODEL_SERVER_URL}${endpoint}`,
-      data,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': MODEL_API_KEY
-        },
-        timeout: 60000 // 60 second timeout
-      }
-    );
-    return response.data;
-  } catch (error) {
-    console.error('Error calling model server:', error.message);
-    if (error.response) {
-      throw new Error(error.response.data.detail || 'Model server error');
+  const response = await axios.post(
+    `${MODEL_SERVER_URL}${endpoint}`,
+    data,
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": MODEL_API_KEY,
+      },
+      timeout: 60000,
     }
-    throw new Error('Failed to connect to model server');
+  );
+  return response.data;
+}
+
+/* =======================
+   RAG CONTEXT RETRIEVAL
+======================= */
+async function retrieveContext(query) {
+  if (!RAG_SERVICE_URL) return "";
+
+  try {
+    const res = await axios.post(`${RAG_SERVICE_URL}/retrieve`, {
+      query,
+      k: 5,
+    });
+
+    return res.data.context || "";
+  } catch (err) {
+    console.error("RAG retrieval failed:", err.message);
+    return "";
   }
 }
 
-// Routes
-
-// Health check
-app.get('/api/health', async (req, res) => {
+/* =======================
+   HEALTH CHECK
+======================= */
+app.get("/api/health", async (req, res) => {
   try {
-    // Check if model server is accessible
     const modelHealth = await axios.get(`${MODEL_SERVER_URL}/health`, {
-      headers: { 'X-API-Key': MODEL_API_KEY },
-      timeout: 5000
+      headers: { "X-API-Key": MODEL_API_KEY },
+      timeout: 5000,
     });
-    
+
     res.json({
-      status: 'healthy',
-      backend: 'running',
+      status: "healthy",
+      backend: "running",
       modelServer: modelHealth.data,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
     res.status(503).json({
-      status: 'unhealthy',
-      backend: 'running',
-      modelServer: 'unreachable',
+      status: "unhealthy",
+      backend: "running",
+      modelServer: "unreachable",
       error: error.message,
-      timestamp: new Date().toISOString()
     });
   }
 });
 
-// Chat endpoint
-app.post('/api/chat', chatLimiter, async (req, res) => {
+/* =======================
+   CHAT ENDPOINT (RAG)
+======================= */
+app.post("/api/chat", chatLimiter, async (req, res) => {
   try {
     const { message, sessionId, options = {} } = req.body;
 
-    if (!message || message.trim().length === 0) {
-      return res.status(400).json({ error: 'Message is required' });
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Message is required" });
     }
 
-    // Get or create conversation history
     const session = sessionId || `session_${Date.now()}`;
     let history = conversationStore.get(session) || [];
 
-    // Prepare request for model server
+    /* ---- RAG ---- */
+    const context = await retrieveContext(message.trim());
+
+    const augmentedPrompt = context
+      ? `You are a legal assistant.
+Answer ONLY using the context below.
+
+Context:
+${context}
+
+Question:
+${message.trim()}
+
+Answer:`
+      : message.trim();
+
+    /* ---- MODEL REQUEST ---- */
     const modelRequest = {
-      message: message.trim(),
+      message: augmentedPrompt,
       max_length: options.maxLength || 512,
       temperature: options.temperature || 0.7,
       top_p: options.topP || 0.9,
-      conversation_history: history
+      conversation_history: history,
     };
 
-    // Call model server
-    const modelResponse = await callModelServer('/chat', modelRequest);
+    const modelResponse = await callModelServer("/chat", modelRequest);
 
-    // Update conversation history
     history.push({
       user: message.trim(),
-      assistant: modelResponse.response
+      assistant: modelResponse.response,
     });
 
-    // Keep only last 10 exchanges to prevent memory issues
-    if (history.length > 10) {
-      history = history.slice(-10);
-    }
+    if (history.length > 10) history = history.slice(-10);
     conversationStore.set(session, history);
 
-    // Send response
     res.json({
       response: modelResponse.response,
       sessionId: session,
       modelName: modelResponse.model_name,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
-
   } catch (error) {
-    console.error('Chat error:', error);
+    console.error("Chat error:", error);
     res.status(500).json({
-      error: 'Failed to generate response',
-      message: error.message
+      error: "Failed to generate response",
+      message: error.message,
     });
   }
 });
 
-// Simple generate endpoint (without history)
-app.post('/api/generate', chatLimiter, async (req, res) => {
+/* =======================
+   SIMPLE GENERATE
+======================= */
+app.post("/api/generate", chatLimiter, async (req, res) => {
   try {
     const { prompt, options = {} } = req.body;
 
-    if (!prompt || prompt.trim().length === 0) {
-      return res.status(400).json({ error: 'Prompt is required' });
+    if (!prompt || !prompt.trim()) {
+      return res.status(400).json({ error: "Prompt is required" });
     }
 
     const modelRequest = {
       message: prompt.trim(),
       max_length: options.maxLength || 512,
       temperature: options.temperature || 0.7,
-      top_p: options.topP || 0.9
+      top_p: options.topP || 0.9,
     };
 
-    const modelResponse = await callModelServer('/generate', modelRequest);
+    const modelResponse = await callModelServer("/generate", modelRequest);
 
     res.json({
       response: modelResponse.response,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
-
   } catch (error) {
-    console.error('Generate error:', error);
     res.status(500).json({
-      error: 'Failed to generate response',
-      message: error.message
+      error: "Failed to generate response",
+      message: error.message,
     });
   }
 });
 
-// Clear conversation history
-app.delete('/api/chat/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  conversationStore.delete(sessionId);
-  res.json({ message: 'Conversation cleared', sessionId });
+/* =======================
+   CHAT HISTORY
+======================= */
+app.get("/api/chat/:sessionId", (req, res) => {
+  const history = conversationStore.get(req.params.sessionId) || [];
+  res.json({ sessionId: req.params.sessionId, history });
 });
 
-// Get conversation history
-app.get('/api/chat/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  const history = conversationStore.get(sessionId) || [];
-  res.json({ sessionId, history });
+app.delete("/api/chat/:sessionId", (req, res) => {
+  conversationStore.delete(req.params.sessionId);
+  res.json({ message: "Conversation cleared" });
 });
 
-// 404 handler
+/* =======================
+   FALLBACKS
+======================= */
 app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
+  res.status(404).json({ error: "Route not found" });
 });
 
-// Error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined
-  });
-});
-
-// Start server
+/* =======================
+   START SERVER
+======================= */
 app.listen(PORT, () => {
-  console.log(`🚀 Backend server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`🚀 Backend running on port ${PORT}`);
   console.log(`🤖 Model server: ${MODEL_SERVER_URL}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received: closing HTTP server');
-  server.close(() => {
-    console.log('HTTP server closed');
-  });
+  console.log(`📚 RAG service: ${RAG_SERVICE_URL}`);
 });
