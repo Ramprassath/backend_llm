@@ -20,8 +20,13 @@ app.use(express.json());
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "*",
+    origin: [
+      process.env.FRONTEND_URL || "*",
+      "https://ramprassath.github.io",
+      "http://localhost:5173", // For local development
+    ],
     credentials: true,
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   })
 );
 
