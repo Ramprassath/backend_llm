@@ -14,21 +14,52 @@ const PORT = process.env.PORT || 3000;
 /* =======================
    MIDDLEWARE
 ======================= */
-app.use(helmet());
+/* =======================
+   MIDDLEWARE
+======================= */
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
 app.use(morgan("combined"));
 app.use(express.json());
 
+// CORS Configuration - ALLOW ALL LOCALHOST PORTS
 app.use(
   cors({
-    origin: [
-      process.env.FRONTEND_URL || "*",
-      "https://ramprassath.github.io",
-      "http://localhost:5173", // For local development
-    ],
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin) return callback(null, true);
+      
+      const allowedOrigins = [
+        'http://localhost:5173',
+        'http://localhost:4173',
+        'http://localhost:3000',
+        'http://127.0.0.1:5173',
+        'http://127.0.0.1:4173',
+        'https://ramprassath.github.io',
+        process.env.FRONTEND_URL,
+      ];
+      
+      // Allow any localhost port for development
+      if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+        return callback(null, true);
+      }
+      
+      if (allowedOrigins.indexOf(origin) !== -1 || !origin) {
+        callback(null, true);
+      } else {
+        console.log('CORS blocked origin:', origin);
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     credentials: true,
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
   })
 );
+
+// Add explicit OPTIONS handler
+app.options('*', cors());
 
 /* =======================
    RATE LIMITING
