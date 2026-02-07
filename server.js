@@ -61,6 +61,14 @@ app.use(
 // Add explicit OPTIONS handler
 app.options('*', cors());
 
+// Debug middleware - remove after fixing
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.path} from origin: ${req.headers.origin}`);
+  next();
+});
+
+
+
 /* =======================
    RATE LIMITING
 ======================= */
