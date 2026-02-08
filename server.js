@@ -14,60 +14,32 @@ const PORT = process.env.PORT || 3000;
 /* =======================
    MIDDLEWARE
 ======================= */
-/* =======================
-   MIDDLEWARE
-======================= */
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
 app.use(morgan("combined"));
 app.use(express.json());
 
-// CORS Configuration - ALLOW ALL LOCALHOST PORTS
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no origin (like mobile apps or curl requests)
       if (!origin) return callback(null, true);
-      
-      const allowedOrigins = [
-        'http://localhost:5173',
-        'http://localhost:4173',
-        'http://localhost:3000',
-        'http://127.0.0.1:5173',
-        'http://127.0.0.1:4173',
-        'https://ramprassath.github.io',
-        process.env.FRONTEND_URL,
-      ];
-      
-      // Allow any localhost port for development
-      if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      if (
+        origin.includes("localhost") ||
+        origin.includes("127.0.0.1") ||
+        origin === process.env.FRONTEND_URL
+      ) {
         return callback(null, true);
       }
-      
-      if (allowedOrigins.indexOf(origin) !== -1 || !origin) {
-        callback(null, true);
-      } else {
-        console.log('CORS blocked origin:', origin);
-        callback(new Error('Not allowed by CORS'));
-      }
+      callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
-    methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
   })
 );
 
-// Add explicit OPTIONS handler
-app.options('*', cors());
-
-// Debug middleware - remove after fixing
-app.use((req, res, next) => {
-  console.log(`${req.method} ${req.path} from origin: ${req.headers.origin}`);
-  next();
-});
-
-
+app.options("*", cors());
 
 /* =======================
    RATE LIMITING
@@ -94,6 +66,47 @@ const RAG_SERVICE_URL = process.env.RAG_SERVICE_URL;
    IN-MEMORY CHAT STORE
 ======================= */
 const conversationStore = new Map();
+
+/* =======================
+   PROMPT ENGINEERING
+======================= */
+const SYSTEM_PROMPT = `
+You are a legal AI assistant specialized ONLY in Indian Law.
+
+Jurisdiction Rules:
+- Use ONLY Indian law (IPC, CrPC, CPC, Constitution of India, Indian Acts).
+- Do NOT mention or rely on US law, UK law, or any foreign law.
+
+Knowledge Rules:
+- Answer ONLY using the provided context.
+- If the answer is not present in the context, say:
+"I don't have enough information under Indian law to answer this question."
+
+Formatting Rules:
+- Answer STRICTLY in bullet points.
+- Maximum 5 bullet points.
+- One complete idea per bullet.
+- No paragraphs, no extra text.
+
+Do NOT guess.
+Do NOT generalize.
+`;
+
+function buildRagPrompt(context, question) {
+  return `
+SYSTEM:
+${SYSTEM_PROMPT}
+
+USER:
+Context:
+${context}
+
+Question:
+${question}
+
+Answer:
+`.trim();
+}
 
 /* =======================
    MODEL SERVER CALL
@@ -124,7 +137,6 @@ async function retrieveContext(query) {
       query,
       k: 5,
     });
-
     return res.data.context || "";
   } catch (err) {
     console.error("RAG retrieval failed:", err.message);
@@ -159,11 +171,11 @@ app.get("/api/health", async (req, res) => {
 });
 
 /* =======================
-   CHAT ENDPOINT (RAG)
+   CHAT ENDPOINT (STRICT RAG)
 ======================= */
 app.post("/api/chat", chatLimiter, async (req, res) => {
   try {
-    const { message, sessionId, options = {} } = req.body;
+    const { message, sessionId } = req.body;
 
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required" });
@@ -175,25 +187,29 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
     /* ---- RAG ---- */
     const context = await retrieveContext(message.trim());
 
-    const augmentedPrompt = context
-      ? `You are a legal assistant.
-Answer ONLY using the context below.
+    // 🔒 STRICT MODE: NO CONTEXT = NO ANSWER
+    if (!context || !context.trim()) {
+      return res.json({
+        response:
+          "I don't have enough information under Indian law to answer this question.",
+        sessionId: session,
+        timestamp: new Date().toISOString(),
+      });
+    }
 
-Context:
-${context}
-
-Question:
-${message.trim()}
-
-Answer:`
-      : message.trim();
+    /* ---- PROMPT ENGINEERING ---- */
+    const engineeredPrompt = buildRagPrompt(
+      context,
+      message.trim()
+    );
 
     /* ---- MODEL REQUEST ---- */
     const modelRequest = {
-      message: augmentedPrompt,
-      max_length: options.maxLength || 512,
-      temperature: options.temperature || 0.7,
-      top_p: options.topP || 0.9,
+      message: engineeredPrompt,
+      max_length: 400,
+      temperature: 0.2,
+      top_p: 0.9,
+      repetition_penalty: 1.1,
       conversation_history: history,
     };
 
@@ -223,11 +239,11 @@ Answer:`
 });
 
 /* =======================
-   SIMPLE GENERATE
+   SIMPLE GENERATE (NO RAG)
 ======================= */
 app.post("/api/generate", chatLimiter, async (req, res) => {
   try {
-    const { prompt, options = {} } = req.body;
+    const { prompt } = req.body;
 
     if (!prompt || !prompt.trim()) {
       return res.status(400).json({ error: "Prompt is required" });
@@ -235,9 +251,9 @@ app.post("/api/generate", chatLimiter, async (req, res) => {
 
     const modelRequest = {
       message: prompt.trim(),
-      max_length: options.maxLength || 512,
-      temperature: options.temperature || 0.7,
-      top_p: options.topP || 0.9,
+      max_length: 512,
+      temperature: 0.7,
+      top_p: 0.9,
     };
 
     const modelResponse = await callModelServer("/generate", modelRequest);
@@ -268,7 +284,7 @@ app.delete("/api/chat/:sessionId", (req, res) => {
 });
 
 /* =======================
-   FALLBACKS
+   FALLBACK
 ======================= */
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
