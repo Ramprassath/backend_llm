@@ -23,26 +23,15 @@ app.use(morgan("combined"));
 app.use(express.json());
 
 /* =======================
-   CORS (SAFE)
+   ✅ CORS (FRONTEND SAFE)
+   ⚠️ Do NOT block browser
 ======================= */
 app.use(
   cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-
-      if (
-        origin.includes("localhost") ||
-        origin.includes("127.0.0.1") ||
-        origin === process.env.FRONTEND_URL ||
-        origin === "https://ramprassath.github.io"
-      ) {
-        return callback(null, true);
-      }
-
-      console.warn("CORS blocked origin:", origin);
-      return callback(null, false);
-    },
-    credentials: true,
+    origin: true,          // 🔑 allow all origins
+    credentials: true,     // 🔑 required for browser
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
   })
 );
 
@@ -74,15 +63,16 @@ const RAG_SERVICE_URL = process.env.RAG_SERVICE_URL;
 /* =======================
    PROMPT ENGINEERING
 ======================= */
-const STRICT_RAG_PROMPT = (context, question) => `
+function buildStrictRagPrompt(context, question) {
+  return `
 You are a legal AI assistant specialized ONLY in Indian Law.
 
 Rules:
-- Use ONLY the provided context
+- Use ONLY the context provided
 - Use ONLY Indian law
-- Answer strictly in bullet points
-- Do NOT invent sections
-- Do NOT use foreign law
+- Answer in bullet points
+- Do NOT invent section numbers
+- Do NOT mention foreign laws
 
 Context:
 ${context}
@@ -91,23 +81,26 @@ Question:
 ${question}
 
 Answer:
-`;
+`.trim();
+}
 
-const HYBRID_LAW_PROMPT = (question) => `
+function buildHybridLawPrompt(question) {
+  return `
 You are a legal AI assistant specialized ONLY in Indian Law.
 
 Rules:
-- Answer using your general understanding of Indian law
-- Do NOT mention US, UK, or foreign law
-- Do NOT invent IPC section numbers or punishments
-- If unsure, clearly say so
-- Answer strictly in bullet points
+- Use your general understanding of Indian law
+- Do NOT mention foreign laws
+- Do NOT invent IPC sections or punishments
+- If unsure, say so clearly
+- Answer in bullet points
 
 Question:
 ${question}
 
 Answer:
-`;
+`.trim();
+}
 
 /* =======================
    MODEL SERVER CALL
@@ -145,24 +138,38 @@ async function retrieveContext(query) {
 }
 
 /* =======================
+   HEALTH CHECK
+======================= */
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    backend: "running",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/* =======================
    CHAT ENDPOINT
 ======================= */
 app.post("/api/chat", chatLimiter, async (req, res) => {
   try {
     const { message } = req.body;
-    if (!message) return res.status(400).json({ error: "Message required" });
 
-    const context = await retrieveContext(message);
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    const context = await retrieveContext(message.trim());
 
     let prompt;
 
-    // ✅ RAG HIT → strict factual answer
-    if (context && context.trim().length > 50) {
-      prompt = STRICT_RAG_PROMPT(context, message);
+    // ✅ Use RAG if available
+    if (context && context.trim().length > 30) {
+      prompt = buildStrictRagPrompt(context, message.trim());
     }
-    // 🟡 RAG MISS → allow Indian-law reasoning
+    // ✅ Otherwise allow Indian-law reasoning
     else {
-      prompt = HYBRID_LAW_PROMPT(message);
+      prompt = buildHybridLawPrompt(message.trim());
     }
 
     const modelResponse = await callModelServer("/chat", {
@@ -177,12 +184,48 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
       response: modelResponse.response,
       timestamp: new Date().toISOString(),
     });
-  } catch (err) {
+  } catch (error) {
+    console.error("Chat error:", error.message);
     res.status(500).json({
-      error: "Chat failed",
-      message: err.message,
+      error: "Failed to generate response",
     });
   }
+});
+
+/* =======================
+   SIMPLE GENERATE
+======================= */
+app.post("/api/generate", chatLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+
+    if (!prompt || !prompt.trim()) {
+      return res.status(400).json({ error: "Prompt is required" });
+    }
+
+    const modelResponse = await callModelServer("/generate", {
+      message: prompt.trim(),
+      max_length: 512,
+      temperature: 0.7,
+      top_p: 0.9,
+    });
+
+    res.json({
+      response: modelResponse.response,
+      timestamp: new Date().toISOString(),
+    });
+  } catch {
+    res.status(500).json({
+      error: "Failed to generate response",
+    });
+  }
+});
+
+/* =======================
+   FALLBACK
+======================= */
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
 });
 
 /* =======================
