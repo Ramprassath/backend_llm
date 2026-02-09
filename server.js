@@ -12,6 +12,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 /* =======================
+   ✅ FIX: TRUST PROXY
+   Required for rate limiting behind reverse proxy
+======================= */
+app.set('trust proxy', 1);
+
+/* =======================
    MIDDLEWARE
 ======================= */
 app.use(
